@@ -30,7 +30,8 @@ from pydicom.pixel_data_handlers.util import apply_voi_lut
 from hybrid_cxr_detector import create_loss, create_model, create_pretrainer
 
 
-DEFAULT_DATA_ROOT = Path(__file__).resolve().parents[2] / "DPL" / "project" / "data"
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_DATA_ROOT = PROJECT_ROOT / ("data_jpg" if (PROJECT_ROOT / "data_jpg").exists() else "data")
 NO_FINDING_CLASS_ID = 14
 DETECT_NUM_CLASSES = 14
 CLASS_NAMES = [
@@ -48,12 +49,14 @@ def seed_everything(seed: int) -> None:
 
 def resolve_data_root(path: str | None) -> Path:
     root = Path(path) if path else DEFAULT_DATA_ROOT
+    if not root.exists() and root.name == "data" and (root.parent / "data_jpg").exists():
+        root = root.parent / "data_jpg"
     if not root.exists():
         raise FileNotFoundError(f"data root not found: {root}")
     if not (root / "train.csv").exists():
         raise FileNotFoundError(f"missing train.csv under {root}")
     if not (root / "train").exists():
-        raise FileNotFoundError(f"missing train DICOM folder under {root}")
+        raise FileNotFoundError(f"missing train image folder under {root}")
     return root
 
 
@@ -87,6 +90,18 @@ def read_train_image(data_root: Path, image_id: str, use_jpg_cache: bool = True,
     jpg_path = data_root / "train_jpg" / f"{image_id}.jpg"
     if use_jpg_cache and jpg_path.exists():
         return read_jpg_image(jpg_path)
+    train_jpg_path = data_root / "train" / f"{image_id}.jpg"
+    if train_jpg_path.exists():
+        return read_jpg_image(train_jpg_path)
+    train_jpeg_path = data_root / "train" / f"{image_id}.jpeg"
+    if train_jpeg_path.exists():
+        return read_jpg_image(train_jpeg_path)
+    flat_jpg_path = data_root / f"{image_id}.jpg"
+    if flat_jpg_path.exists():
+        return read_jpg_image(flat_jpg_path)
+    flat_jpeg_path = data_root / f"{image_id}.jpeg"
+    if flat_jpeg_path.exists():
+        return read_jpg_image(flat_jpeg_path)
     dicom_path = data_root / "train" / f"{image_id}.dicom"
     img = read_dicom_image(dicom_path)
     if use_jpg_cache:
@@ -191,11 +206,12 @@ def cxr_aug_pair(image: Tensor) -> Tuple[Tensor, Tensor]:
 
 
 def image_detection_labels(rows: pd.DataFrame) -> set[int]:
-    return {int(c) for c in rows["class_id"].tolist() if int(c) != NO_FINDING_CLASS_ID}
+    labels = {int(c) for c in rows["class_id"].tolist() if int(c) != NO_FINDING_CLASS_ID}
+    return labels if labels else {NO_FINDING_CLASS_ID}
 
 
 def split_train_val_test_ids(groups: Dict[str, pd.DataFrame], val_fraction: float, test_fraction: float, seed: int) -> Dict[str, List[str]]:
-    """Stable multilabel-aware 80/10/10-style split from labeled train images only."""
+    """Iterative multilabel-stratified split over all diseases and No finding."""
     val_fraction = min(max(float(val_fraction), 0.0), 0.4)
     test_fraction = min(max(float(test_fraction), 0.0), 0.4)
     if val_fraction + test_fraction >= 0.8:
@@ -203,36 +219,66 @@ def split_train_val_test_ids(groups: Dict[str, pd.DataFrame], val_fraction: floa
     ids = sorted(groups.keys())
     rng = random.Random(seed)
     labels_by_id = {image_id: image_detection_labels(groups[image_id]) for image_id in ids}
-    global_counts = defaultdict(int)
-    for labels in labels_by_id.values():
-        for label in labels:
-            global_counts[label] += 1
-    target_sizes = {
-        "test": int(round(len(ids) * test_fraction)),
-        "val": int(round(len(ids) * val_fraction)),
-    }
+    normal_ids = [image_id for image_id in ids if labels_by_id[image_id] == {NO_FINDING_CLASS_ID}]
+    abnormal_ids = [image_id for image_id in ids if labels_by_id[image_id] != {NO_FINDING_CLASS_ID}]
+    split_names = ("train", "val", "test")
+    fractions = {"train": 1.0 - val_fraction - test_fraction, "val": val_fraction, "test": test_fraction}
+    target_sizes = {"val": int(round(len(ids) * val_fraction)), "test": int(round(len(ids) * test_fraction))}
     target_sizes["train"] = len(ids) - target_sizes["val"] - target_sizes["test"]
-    target_class_counts = {split: {cls: count * target_sizes[split] / max(len(ids), 1) for cls, count in global_counts.items()} for split in target_sizes}
     split_ids = {"train": [], "val": [], "test": []}
-    split_class_counts = {split: defaultdict(int) for split in split_ids}
-    ordered = ids[:]
-    rng.shuffle(ordered)
-    ordered.sort(key=lambda image_id: (len(labels_by_id[image_id]) == 0, -sum(1.0 / max(global_counts[c], 1) for c in labels_by_id[image_id])))
-    for image_id in ordered:
+    target_normal = {"val": int(round(len(normal_ids) * val_fraction)), "test": int(round(len(normal_ids) * test_fraction))}
+    target_normal["train"] = len(normal_ids) - target_normal["val"] - target_normal["test"]
+    normal_order = normal_ids[:]
+    rng.shuffle(normal_order)
+    cursor = 0
+    for split in split_names:
+        take = target_normal[split]
+        split_ids[split].extend(normal_order[cursor : cursor + take])
+        cursor += take
+    target_abnormal = {split: target_sizes[split] - target_normal[split] for split in split_names}
+    remaining_size = target_sizes.copy()
+    for split in split_names:
+        remaining_size[split] = target_abnormal[split]
+    label_totals = defaultdict(int)
+    label_to_ids = defaultdict(set)
+    for image_id in abnormal_ids:
         labels = labels_by_id[image_id]
-        candidates = [s for s in ("test", "val", "train") if len(split_ids[s]) < target_sizes[s]]
-        if not candidates:
-            candidates = ["train"]
+        for label in labels:
+            label_totals[label] += 1
+            label_to_ids[label].add(image_id)
+    remaining_label_need = {
+        split: {label: label_totals[label] * target_abnormal[split] / max(len(abnormal_ids), 1) for label in label_totals}
+        for split in split_names
+    }
+    unassigned = set(abnormal_ids)
+    while unassigned:
+        active_labels = [(len(label_to_ids[label] & unassigned), label) for label in label_totals if label_to_ids[label] & unassigned]
+        if active_labels:
+            _, rare_label = min(active_labels)
+            candidates = list(label_to_ids[rare_label] & unassigned)
+        else:
+            candidates = list(unassigned)
+        rng.shuffle(candidates)
+        for image_id in candidates:
+            if image_id not in unassigned:
+                continue
+            available = [split for split in split_names if remaining_size[split] > 0]
+            if not available:
+                available = ["train"]
+            labels = labels_by_id[image_id]
 
-        def score(split: str) -> float:
-            size_need = (target_sizes[split] - len(split_ids[split])) / max(target_sizes[split], 1)
-            class_need = sum((target_class_counts[split].get(cls, 0.0) - split_class_counts[split][cls]) / max(global_counts[cls], 1) for cls in labels)
-            return size_need + class_need
+            def assignment_score(split: str) -> Tuple[float, float, float]:
+                rare_need = remaining_label_need[split].get(rare_label, 0.0)
+                all_label_need = sum(max(remaining_label_need[split].get(label, 0.0), 0.0) for label in labels)
+                size_need = remaining_size[split] / max(target_sizes[split], 1)
+                return rare_need, all_label_need, size_need
 
-        chosen = max(candidates, key=score)
-        split_ids[chosen].append(image_id)
-        for cls in labels:
-            split_class_counts[chosen][cls] += 1
+            chosen = max(available, key=assignment_score)
+            split_ids[chosen].append(image_id)
+            remaining_size[chosen] -= 1
+            for label in labels:
+                remaining_label_need[chosen][label] -= 1.0
+            unassigned.remove(image_id)
     for split in split_ids:
         split_ids[split].sort()
     return split_ids
