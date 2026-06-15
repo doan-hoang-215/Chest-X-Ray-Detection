@@ -44,6 +44,54 @@ def seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def resolve_training_device(requested: str = "auto", require_cuda: bool = False) -> torch.device:
+    req = str(requested or "auto").strip().lower()
+    has_cuda = torch.cuda.is_available() and torch.cuda.device_count() > 0
+    if req in {"auto", ""}:
+        device = torch.device("cuda" if has_cuda else "cpu")
+    elif req == "cuda":
+        device = torch.device("cuda" if has_cuda else "cpu")
+    else:
+        device = torch.device(req)
+    if require_cuda and device.type != "cuda":
+        raise RuntimeError(
+            "CUDA was required but PyTorch cannot see a GPU. Install a CUDA build of PyTorch, then re-run."
+        )
+    return device
+
+
+def apply_gpu_training_preset(args, model_name: str) -> None:
+    """Tune defaults for CUDA runs while keeping smoke/quick tests untouched."""
+    preset = str(getattr(args, "gpu_preset", "auto") or "auto").lower()
+    if preset == "none" or getattr(args, "smoke", False) or getattr(args, "quick_test", False):
+        return
+    if preset == "auto":
+        if not torch.cuda.is_available():
+            return
+        total_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        preset = "low" if total_gb < 10 else "medium" if total_gb < 16 else "high"
+
+    table = {
+        "barlow": {
+            "low": {"epochs": 60, "image_size": 512, "batch_size": 4, "num_workers": 4, "channels_last": True, "compile_model": False},
+            "medium": {"epochs": 80, "image_size": 768, "batch_size": 8, "num_workers": 4, "channels_last": True, "compile_model": False},
+            "high": {"epochs": 100, "image_size": 768, "batch_size": 12, "num_workers": 6, "channels_last": True, "compile_model": True},
+        },
+        "nsec": {
+            "low": {"epochs": 80, "image_size": 768, "batch_size": 4, "num_workers": 4, "channels_last": True, "compile_model": False},
+            "medium": {"epochs": 100, "image_size": 768, "batch_size": 8, "num_workers": 4, "channels_last": True, "compile_model": False},
+            "high": {"epochs": 120, "image_size": 1024, "batch_size": 8, "num_workers": 6, "channels_last": True, "compile_model": True},
+        },
+        "detr": {
+            "low": {"epochs": 100, "image_size": 640, "batch_size": 2, "num_workers": 4, "channels_last": True, "compile_model": False},
+            "medium": {"epochs": 120, "image_size": 768, "batch_size": 4, "num_workers": 4, "channels_last": True, "compile_model": False},
+            "high": {"epochs": 150, "image_size": 896, "batch_size": 4, "num_workers": 6, "channels_last": True, "compile_model": True},
+        },
+    }
+    for key, value in table[model_name][preset].items():
+        setattr(args, key, value)
+
+
 def resolve_data_root(path: str | None) -> Path:
     root = Path(path) if path else DEFAULT_DATA_ROOT
     if not root.exists() and root.name == "data" and (root.parent / "data_jpg").exists():
@@ -497,6 +545,69 @@ def save_checkpoint(args, model, name: str) -> None:
     print(f"saved {path}")
 
 
+def save_training_checkpoint(
+    args,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler,
+    epoch: int,
+    step: int,
+    best_metric: float,
+    name: str,
+    ema: ModelEMA | None = None,
+    extra: dict | None = None,
+) -> None:
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    path = args.output_dir / name
+    safe_args = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
+    state = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scaler": scaler.state_dict() if scaler is not None else None,
+        "ema": ema.ema.state_dict() if ema is not None else None,
+        "epoch": int(epoch),
+        "step": int(step),
+        "best_metric": float(best_metric),
+        "args": safe_args,
+    }
+    if extra:
+        state.update(extra)
+    torch.save(state, path)
+    print(f"saved training checkpoint {path}")
+
+
+def resolve_resume_path(args, default_name: str) -> Path | None:
+    resume = getattr(args, "resume", "")
+    if resume:
+        path = Path(resume)
+        return path if path.is_absolute() else Path(path)
+    if getattr(args, "auto_resume", False):
+        path = Path(args.output_dir) / default_name
+        if path.exists():
+            return path
+    return None
+
+
+def load_training_checkpoint(
+    path: Path | str,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer | None,
+    scaler,
+    device: torch.device,
+    ema: ModelEMA | None = None,
+) -> dict:
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt.get("model", ckpt), strict=False)
+    if optimizer is not None and ckpt.get("optimizer") is not None:
+        optimizer.load_state_dict(ckpt["optimizer"])
+    if scaler is not None and ckpt.get("scaler") is not None:
+        scaler.load_state_dict(ckpt["scaler"])
+    if ema is not None and ckpt.get("ema") is not None:
+        ema.ema.load_state_dict(ckpt["ema"], strict=False)
+    print(f"resumed training checkpoint {path} at epoch={ckpt.get('epoch', 0)} step={ckpt.get('step', 0)}")
+    return ckpt
+
+
 
 
 class ModelEMA:
@@ -722,6 +833,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--use-jpg-cache", action="store_true", default=True)
     p.add_argument("--no-jpg-cache", dest="use_jpg_cache", action="store_false")
     p.add_argument("--jpg-quality", type=int, default=95)
+    p.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
+    p.add_argument("--require-cuda", action="store_true")
+    p.add_argument("--gpu-preset", choices=["auto", "low", "medium", "high", "none"], default="auto")
     p.add_argument("--image-size", type=int, default=512)
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--epochs", type=int, default=10)
@@ -775,13 +889,14 @@ def parse_args() -> argparse.Namespace:
         args.no_ema = False
     args.data_root = resolve_data_root(args.data_root)
     args.output_dir = Path(args.output_dir)
+    apply_gpu_training_preset(args, "detr")
     return args
 
 
 def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_training_device(args.device, args.require_cuda)
     print(f"device={device} data_root={args.data_root}")
     if args.phase == "pretrain":
         train_pretrain(args, device)
