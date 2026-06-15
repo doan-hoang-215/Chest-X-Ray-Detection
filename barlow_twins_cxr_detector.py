@@ -35,7 +35,7 @@ except Exception:  # pragma: no cover
     roi_align = None
 
 from hybrid_cxr_detector import HybridCXRConfig, HybridDetectionLoss
-from train_vindr_hybrid import DEFAULT_DATA_ROOT, DETECT_NUM_CLASSES, CLASS_NAMES, VinDrDetectionDataset, detection_collate, evaluate_map50, move_targets, save_checkpoint, seed_everything, build_optimizer, set_warmup_cosine_lr, ModelEMA, save_detection_visualizations
+from train_vindr_hybrid import DEFAULT_DATA_ROOT, DETECT_NUM_CLASSES, CLASS_NAMES, VinDrDetectionDataset, ClassBalancedDetectionBatchSampler, detection_collate, evaluate_map50, move_targets, save_checkpoint, seed_everything, resolve_data_root, resolve_training_device, apply_gpu_training_preset, build_optimizer, set_warmup_cosine_lr, ModelEMA, save_detection_visualizations, save_training_checkpoint, resolve_resume_path, load_training_checkpoint
 
 
 def make_grad_scaler(enabled: bool):
@@ -442,6 +442,11 @@ def make_loader(args, split: str, ssl_pair: bool = False):
     ds = VinDrDetectionDataset(args.data_root, args.image_size, split=split, val_fraction=args.val_fraction, seed=args.seed, max_images=max_images, normal_only=args.normal_only if ssl_pair else False, positive_only=args.positive_only if (split == "train" and not ssl_pair) else False, ssl_pair=ssl_pair, lung_crop=args.lung_crop, test_fraction=args.test_fraction, use_jpg_cache=args.use_jpg_cache, jpg_quality=args.jpg_quality)
     collate = (lambda batch: (torch.stack([b[0] for b in batch]), torch.stack([b[1] for b in batch]))) if ssl_pair else detection_collate
     kwargs = {"batch_size": args.batch_size, "shuffle": split == "train", "num_workers": args.num_workers, "collate_fn": collate, "pin_memory": torch.cuda.is_available(), "drop_last": ssl_pair and split == "train"}
+    if split == "train" and not ssl_pair and args.balanced_batches and not args.positive_only:
+        kwargs.pop("batch_size")
+        kwargs.pop("shuffle")
+        kwargs.pop("drop_last")
+        kwargs["batch_sampler"] = ClassBalancedDetectionBatchSampler(ds, args.batch_size, args.seed, args.positive_fraction)
     if args.num_workers > 0:
         kwargs["persistent_workers"] = True
         kwargs["prefetch_factor"] = 2
@@ -469,10 +474,17 @@ def train_pretrain(args, device):
         group["initial_lr"] = group["lr"]
     total_steps = max(args.epochs * max(len(loader), 1), 1)
     step = 0
+    start_epoch = 0
     last_loss = float("inf")
+    resume_path = resolve_resume_path(args, "barlow_pretrain_last.pt")
+    if resume_path is not None and resume_path.exists():
+        ckpt = load_training_checkpoint(resume_path, model, opt, scaler, device)
+        start_epoch = int(ckpt.get("epoch", 0))
+        step = int(ckpt.get("step", 0))
+        last_loss = -float(ckpt.get("best_metric", -last_loss))
     model.train()
-    for epoch in range(args.epochs):
-        for view1, view2 in loader:
+    for epoch in range(start_epoch, args.epochs):
+        for epoch_step, (view1, view2) in enumerate(loader):
             set_warmup_cosine_lr(opt, step, total_steps, args.warmup_steps, args.min_lr_ratio)
             opt.zero_grad(set_to_none=True)
             view1 = view1.to(device, non_blocking=True)
@@ -492,6 +504,11 @@ def train_pretrain(args, device):
             step += 1
             if args.max_steps and step >= args.max_steps:
                 save(args, model, "barlow_pretrain_smoke.pt"); return -last_loss
+            if args.steps_per_epoch and epoch_step + 1 >= args.steps_per_epoch:
+                break
+        save_training_checkpoint(args, model, opt, scaler, epoch + 1, step, -last_loss, "barlow_pretrain_last.pt")
+        if args.save_every_epoch:
+            save_training_checkpoint(args, model, opt, scaler, epoch + 1, step, -last_loss, f"barlow_pretrain_epoch_{epoch + 1:03d}.pt")
     save(args, model, "barlow_pretrain_final.pt")
     return -last_loss
 
@@ -514,10 +531,17 @@ def train_detect(args, device):
     amp_enabled = args.amp and device.type == "cuda"
     scaler = make_grad_scaler(amp_enabled)
     step = 0
+    start_epoch = 0
     best_map = -1.0
-    for epoch in range(args.epochs):
+    resume_path = resolve_resume_path(args, "barlow_detector_last.pt")
+    if resume_path is not None and resume_path.exists():
+        ckpt = load_training_checkpoint(resume_path, model, opt, scaler, device, ema)
+        start_epoch = int(ckpt.get("epoch", 0))
+        step = int(ckpt.get("step", 0))
+        best_map = float(ckpt.get("best_metric", best_map))
+    for epoch in range(start_epoch, args.epochs):
         model.train()
-        for images, targets in train_loader:
+        for epoch_step, (images, targets) in enumerate(train_loader):
             set_warmup_cosine_lr(opt, step, total_steps, args.warmup_steps, args.min_lr_ratio)
             opt.zero_grad(set_to_none=True)
             images = images.to(device, non_blocking=True)
@@ -533,17 +557,23 @@ def train_detect(args, device):
             scaler.update()
             if ema is not None:
                 ema.update(model)
-            print(f"barlow detect epoch={epoch} step={step} loss={losses['loss'].detach().item():.4f}")
+            box_count = sum(int(target["boxes"].shape[0]) for target in moved_targets)
+            print(f"barlow detect epoch={epoch} step={step} boxes={box_count} loss={losses['loss'].detach().item():.8f}")
             step += 1
             if args.max_steps and step >= args.max_steps:
                 save(args, ema.ema if ema else model, "barlow_detector_smoke.pt")
                 eval_model = ema.ema if ema else model
                 return evaluate_map50(eval_model, val_loader, device, args.map_steps)
+            if args.steps_per_epoch and epoch_step + 1 >= args.steps_per_epoch:
+                break
         eval_model = ema.ema if ema else model
         map50 = evaluate_map50(eval_model, val_loader, device, args.map_steps)
         print(f"val epoch={epoch} mAP50={map50:.4f}")
         if map50 > best_map:
             best_map = map50; save(args, eval_model, "barlow_detector_best.pt")
+        save_training_checkpoint(args, model, opt, scaler, epoch + 1, step, best_map, "barlow_detector_last.pt", ema)
+        if args.save_every_epoch:
+            save_training_checkpoint(args, model, opt, scaler, epoch + 1, step, best_map, f"barlow_detector_epoch_{epoch + 1:03d}.pt", ema)
     save(args, ema.ema if ema else model, "barlow_detector_final.pt")
     if args.visualize:
         visualize(ema.ema if ema else model, args, device)
@@ -570,11 +600,20 @@ def parse_args():
     p.add_argument("--test-fraction", type=float, default=0.1)
     p.add_argument("--normal-only", action="store_true")
     p.add_argument("--positive-only", action="store_true")
+    p.add_argument("--balanced-batches", action="store_true", default=True)
+    p.add_argument("--no-balanced-batches", dest="balanced_batches", action="store_false")
+    p.add_argument("--positive-fraction", type=float, default=0.5)
     p.add_argument("--lung-crop", action="store_true", default=True)
     p.add_argument("--no-lung-crop", dest="lung_crop", action="store_false")
     p.add_argument("--use-jpg-cache", action="store_true", default=True)
     p.add_argument("--no-jpg-cache", dest="use_jpg_cache", action="store_false")
     p.add_argument("--jpg-quality", type=int, default=95)
+    p.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
+    p.add_argument("--require-cuda", action="store_true")
+    p.add_argument("--gpu-preset", choices=["auto", "low", "medium", "high", "none"], default="auto")
+    p.add_argument("--resume", type=str, default="", help="Resume from an explicit training checkpoint path.")
+    p.add_argument("--auto-resume", action="store_true", help="Resume from the latest checkpoint in output-dir if it exists.")
+    p.add_argument("--save-every-epoch", action="store_true", help="Keep a numbered checkpoint for every finished epoch.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--lr", type=float, default=1e-4)
@@ -612,13 +651,25 @@ def parse_args():
     p.add_argument("--search-trials", type=int, default=12)
     p.add_argument("--search-max-steps", type=int, default=80)
     p.add_argument("--search-seed", type=int, default=123)
+    p.add_argument("--quick-test", action="store_true", help="Run a short 5-epoch test with 64 train steps per epoch.")
+    p.add_argument("--quick-epochs", type=int, default=5)
+    p.add_argument("--quick-steps", type=int, default=64)
     p.add_argument("--smoke", action="store_true")
     args = p.parse_args()
+    args.data_root = resolve_data_root(str(args.data_root))
     args.max_steps = 0
+    args.steps_per_epoch = 0
+    apply_gpu_training_preset(args, "barlow")
+    if args.quick_test:
+        args.epochs = min(max(args.quick_epochs, 5), 10)
+        args.steps_per_epoch = min(max(args.quick_steps, 60), 70)
+        args.val_max_images = min(args.val_max_images, 128)
+        args.map_steps = min(args.map_steps, 10)
+        args.output_dir = args.output_dir / "quick_test"
     if args.smoke:
         args.epochs = 1; args.image_size = 128; args.batch_size = 2; args.max_images = 4; args.val_max_images = 4
         args.base_channels = 8; args.hidden_dim = 32; args.topk_per_head = 8; args.projector_dim = 256; args.projector_hidden_dim = 128
-        args.max_steps = 1; args.warmup_steps = 1; args.positive_only = True
+        args.max_steps = 1; args.steps_per_epoch = 1; args.warmup_steps = 1; args.positive_only = True
         if args.phase == "pretrain": args.normal_only = True
     return args
 
@@ -662,7 +713,7 @@ def random_search(args) -> None:
     rng = random.Random(args.search_seed)
     rows = []
     root = args.output_dir / f"random_search_{args.phase}"
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_training_device(args.device, args.require_cuda)
     for trial in range(args.search_trials):
         trial_args = copy.deepcopy(args)
         trial_args.random_search = False
@@ -696,7 +747,7 @@ def random_search(args) -> None:
 def main():
     args = parse_args()
     seed_everything(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_training_device(args.device, args.require_cuda)
     print(f"device={device} phase={args.phase} data={args.data_root}")
     if args.random_search:
         random_search(args)
