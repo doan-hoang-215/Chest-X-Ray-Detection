@@ -622,12 +622,17 @@ class ModelEMA:
     def update(self, model: torch.nn.Module) -> None:
         ema_state = self.ema.state_dict()
         model_state = model.state_dict()
-        for k, v in ema_state.items():
-            src = model_state[k].detach()
+        for key in list(ema_state.keys()):
+            v = ema_state[key]
+            src = model_state.get(key)
+            if src is None or src.shape != v.shape:
+                continue
+            src = src.detach()
             if v.dtype.is_floating_point:
+                src = src.to(device=v.device, dtype=v.dtype)
                 v.mul_(self.decay).add_(src, alpha=1.0 - self.decay)
             else:
-                v.copy_(src)
+                v.copy_(src.to(device=v.device, dtype=v.dtype))
 
 
 def build_optimizer(model: torch.nn.Module, args) -> torch.optim.Optimizer:
