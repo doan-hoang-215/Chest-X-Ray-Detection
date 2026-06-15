@@ -14,7 +14,7 @@ import math
 import random
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -22,10 +22,7 @@ import pandas as pd
 import torch
 from torch import Tensor
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
-
-import pydicom
-from pydicom.pixel_data_handlers.util import apply_voi_lut
+from torch.utils.data import BatchSampler, DataLoader, Dataset
 
 from hybrid_cxr_detector import create_loss, create_model, create_pretrainer
 
@@ -55,12 +52,42 @@ def resolve_data_root(path: str | None) -> Path:
         raise FileNotFoundError(f"data root not found: {root}")
     if not (root / "train.csv").exists():
         raise FileNotFoundError(f"missing train.csv under {root}")
-    if not (root / "train").exists():
-        raise FileNotFoundError(f"missing train image folder under {root}")
+    has_images = any(
+        root.glob(pattern)
+        for pattern in (
+            "*.jpg",
+            "*.jpeg",
+            "*.png",
+            "train/*.jpg",
+            "train/*.jpeg",
+            "train/*.png",
+            "train/*.dicom",
+            "train/*.dcm",
+            "train_jpg/*.jpg",
+            "train_jpg/*.jpeg",
+            "train_jpg/*.png",
+        )
+    )
+    if not has_images:
+        raise FileNotFoundError(
+            f"missing train images under {root}; expected flat JPG/PNG, train_jpg/*.jpg, train/*.jpg, or train/*.dicom"
+        )
     return root
 
 
 def read_dicom_image(path: Path) -> np.ndarray:
+    if not path.exists():
+        raise FileNotFoundError(f"missing DICOM image: {path}")
+    try:
+        import pydicom
+        try:
+            from pydicom.pixels import apply_voi_lut
+        except Exception:
+            from pydicom.pixel_data_handlers.util import apply_voi_lut
+    except Exception as exc:
+        raise ImportError(
+            "pydicom is only required for DICOM input. You are using DICOM fallback because no JPG/PNG was found for this image."
+        ) from exc
     ds = pydicom.dcmread(str(path))
     try:
         arr = apply_voi_lut(ds.pixel_array, ds).astype(np.float32)
@@ -77,34 +104,34 @@ def read_dicom_image(path: Path) -> np.ndarray:
     return arr.astype(np.float32)
 
 
-def read_jpg_image(path: Path) -> np.ndarray:
+def read_gray_image(path: Path) -> np.ndarray:
     data = np.frombuffer(path.read_bytes(), dtype=np.uint8)
     img = cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)
     if img is None:
-        raise FileNotFoundError(f"cannot read JPG image: {path}")
+        raise FileNotFoundError(f"cannot read image: {path}")
     return (img.astype(np.float32) / 255.0).clip(0.0, 1.0)
 
 
+def find_train_raster_image(data_root: Path, image_id: str) -> Optional[Path]:
+    for directory in (data_root, data_root / "train", data_root / "train_jpg"):
+        for ext in (".jpg", ".jpeg", ".png"):
+            path = directory / f"{image_id}{ext}"
+            if path.exists():
+                return path
+    return None
+
+
 def read_train_image(data_root: Path, image_id: str, use_jpg_cache: bool = True, jpg_quality: int = 95) -> np.ndarray:
-    """Read train image through a normalized JPG cache to avoid repeated DICOM decode."""
-    jpg_path = data_root / "train_jpg" / f"{image_id}.jpg"
-    if use_jpg_cache and jpg_path.exists():
-        return read_jpg_image(jpg_path)
-    train_jpg_path = data_root / "train" / f"{image_id}.jpg"
-    if train_jpg_path.exists():
-        return read_jpg_image(train_jpg_path)
-    train_jpeg_path = data_root / "train" / f"{image_id}.jpeg"
-    if train_jpeg_path.exists():
-        return read_jpg_image(train_jpeg_path)
-    flat_jpg_path = data_root / f"{image_id}.jpg"
-    if flat_jpg_path.exists():
-        return read_jpg_image(flat_jpg_path)
-    flat_jpeg_path = data_root / f"{image_id}.jpeg"
-    if flat_jpeg_path.exists():
-        return read_jpg_image(flat_jpeg_path)
+    """Read flat/nested JPG or PNG first; DICOM is only a legacy fallback."""
+    raster_path = find_train_raster_image(data_root, image_id)
+    if raster_path is not None:
+        return read_gray_image(raster_path)
     dicom_path = data_root / "train" / f"{image_id}.dicom"
+    if not dicom_path.exists():
+        dicom_path = data_root / "train" / f"{image_id}.dcm"
     img = read_dicom_image(dicom_path)
     if use_jpg_cache:
+        jpg_path = data_root / "train_jpg" / f"{image_id}.jpg"
         jpg_path.parent.mkdir(parents=True, exist_ok=True)
         img8 = (img.clip(0.0, 1.0) * 255).astype(np.uint8)
         ok, encoded = cv2.imencode(".jpg", img8, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpg_quality)])
@@ -326,6 +353,47 @@ class VinDrDetectionDataset(Dataset):
         return image, target
 
 
+class ClassBalancedDetectionBatchSampler(BatchSampler):
+    """Build detection batches with positives sampled uniformly by disease class."""
+
+    def __init__(self, dataset: VinDrDetectionDataset, batch_size: int, seed: int, positive_fraction: float = 0.5):
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.seed = int(seed)
+        self.positive_per_batch = min(max(int(round(self.batch_size * positive_fraction)), 1), self.batch_size)
+        self.normal_per_batch = self.batch_size - self.positive_per_batch
+        self.id_to_index = {image_id: idx for idx, image_id in enumerate(dataset.image_ids)}
+        self.class_to_indices: Dict[int, List[int]] = defaultdict(list)
+        self.normal_indices: List[int] = []
+        for image_id, idx in self.id_to_index.items():
+            labels = image_detection_labels(dataset.groups[image_id])
+            diseases = [label for label in labels if label != NO_FINDING_CLASS_ID]
+            if diseases:
+                for label in diseases:
+                    self.class_to_indices[label].append(idx)
+            else:
+                self.normal_indices.append(idx)
+        self.positive_classes = sorted(self.class_to_indices)
+        if not self.positive_classes:
+            raise ValueError("Balanced detection sampling requires at least one positive training image.")
+
+    def __len__(self) -> int:
+        return max(math.ceil(len(self.dataset) / self.batch_size), 1)
+
+    def __iter__(self):
+        rng = random.Random(self.seed + random.randint(0, 2**20))
+        for _ in range(len(self)):
+            batch = []
+            for _ in range(self.positive_per_batch):
+                cls = rng.choice(self.positive_classes)
+                batch.append(rng.choice(self.class_to_indices[cls]))
+            for _ in range(self.normal_per_batch):
+                pool = self.normal_indices or [idx for values in self.class_to_indices.values() for idx in values]
+                batch.append(rng.choice(pool))
+            rng.shuffle(batch)
+            yield batch
+
+
 def detection_collate(batch):
     return torch.stack([item[0] for item in batch], dim=0), [item[1] for item in batch]
 
@@ -403,12 +471,22 @@ def load_pretrained_backbone(model, checkpoint_path: str, device: torch.device) 
         return
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state = ckpt.get("model", ckpt)
+    target_state = model.backbone.state_dict()
     backbone_state = {}
     for key, value in state.items():
-        if key.startswith("backbone."):
-            backbone_state[key.replace("backbone.", "")] = value
+        stripped = key
+        for prefix in ("module.", "model.", "backbone.", "encoder."):
+            if stripped.startswith(prefix):
+                stripped = stripped[len(prefix):]
+        if stripped in target_state and target_state[stripped].shape == value.shape:
+            backbone_state[stripped] = value
+    if not backbone_state:
+        raise ValueError(
+            f"No shape-compatible Barlow backbone tensors found in {checkpoint_path}. "
+            "Use the checkpoint produced by this pipeline's pretrain phase."
+        )
     missing, unexpected = model.backbone.load_state_dict(backbone_state, strict=False)
-    print(f"loaded pretrained backbone from {checkpoint_path}; missing={len(missing)} unexpected={len(unexpected)}")
+    print(f"loaded {len(backbone_state)} Barlow backbone tensors from {checkpoint_path}; missing={len(missing)} unexpected={len(unexpected)}")
 
 
 def save_checkpoint(args, model, name: str) -> None:
