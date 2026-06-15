@@ -410,7 +410,7 @@ class ExplicitBarlowCXRDetector(nn.Module):
                 cx = ((scaled[:, 0] + scaled[:, 2]) * 0.5).long().clamp(0, w - 1)
                 cy = ((scaled[:, 1] + scaled[:, 3]) * 0.5).long().clamp(0, h - 1)
                 pooled = feat[0, :, cy, cx].permute(1, 0).view(keep.numel(), feat.shape[1], 1, 1).expand(-1, -1, 7, 7)
-            roi_features[keep] = pooled
+            roi_features[keep] = pooled.to(dtype=roi_features.dtype)
         return roi_features
 
     def forward(self, image: Tensor) -> Dict[str, Tensor]:
