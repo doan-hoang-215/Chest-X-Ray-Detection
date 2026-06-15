@@ -342,7 +342,8 @@ def train(args) -> None:
     train_loader = make_loader(args, "train")
     val_loader = make_loader(args, "val")
     opt = build_tunable_optimizer(model, args)
-    total_steps = max(args.epochs * max(len(train_loader), 1), 1)
+    effective_steps_per_epoch = min(len(train_loader), args.steps_per_epoch) if args.steps_per_epoch else len(train_loader)
+    total_steps = max(args.epochs * max(effective_steps_per_epoch, 1), 1)
     ema = None if args.no_ema else ModelEMA(model, args.ema_decay)
     amp_enabled = args.amp and device.type == "cuda"
     scaler = make_grad_scaler(amp_enabled)
@@ -376,6 +377,8 @@ def train(args) -> None:
             if step % args.log_every == 0:
                 print(f"detr epoch={epoch} step={step} loss={losses['loss'].detach().item():.4f}")
             step += 1
+            if args.checkpoint_every_steps and step % args.checkpoint_every_steps == 0:
+                save_training_checkpoint(args, model, opt, scaler, epoch, step, best_map, "detr_last.pt", ema)
             if args.max_steps and step >= args.max_steps:
                 save_checkpoint(args, ema.ema if ema else model, "detr_smoke.pt")
                 eval_model = ema.ema if ema else model
@@ -401,7 +404,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
     p.add_argument("--output-dir", type=Path, default=Path("runs/detr_cxr"))
-    p.add_argument("--epochs", type=int, default=80)
+    p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--image-size", type=int, default=768)
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--max-images", type=int, default=None)
@@ -421,8 +424,11 @@ def parse_args():
     p.add_argument("--require-cuda", action="store_true")
     p.add_argument("--gpu-preset", choices=["auto", "low", "medium", "high", "none"], default="auto")
     p.add_argument("--resume", type=str, default="", help="Resume from an explicit training checkpoint path.")
-    p.add_argument("--auto-resume", action="store_true", help="Resume from the latest checkpoint in output-dir if it exists.")
+    p.add_argument("--auto-resume", action="store_true", default=True, help="Resume from the latest checkpoint in output-dir if it exists.")
+    p.add_argument("--no-auto-resume", dest="auto_resume", action="store_false", help="Start from scratch even if a last checkpoint exists.")
     p.add_argument("--save-every-epoch", action="store_true", help="Keep a numbered checkpoint for every finished epoch.")
+    p.add_argument("--checkpoint-every-steps", type=int, default=100, help="Save last checkpoint every N optimizer steps; 0 disables step checkpoints.")
+    p.add_argument("--steps-per-epoch", type=int, default=150, help="Limit optimizer steps per epoch; use 0 for full dataset.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--lr", type=float, default=1e-4)
@@ -467,7 +473,6 @@ def parse_args():
     args = p.parse_args()
     args.data_root = resolve_data_root(str(args.data_root))
     args.max_steps = 0
-    args.steps_per_epoch = 0
     apply_gpu_training_preset(args, "detr")
     if args.quick_test:
         args.epochs = min(max(args.quick_epochs, 5), 10)
