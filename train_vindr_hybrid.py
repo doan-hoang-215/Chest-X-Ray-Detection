@@ -73,19 +73,19 @@ def apply_gpu_training_preset(args, model_name: str) -> None:
 
     table = {
         "barlow": {
-            "low": {"epochs": 60, "image_size": 512, "batch_size": 4, "num_workers": 4, "channels_last": True, "compile_model": False},
-            "medium": {"epochs": 80, "image_size": 768, "batch_size": 8, "num_workers": 4, "channels_last": True, "compile_model": False},
-            "high": {"epochs": 100, "image_size": 768, "batch_size": 12, "num_workers": 6, "channels_last": True, "compile_model": True},
+            "low": {"epochs": 100, "image_size": 512, "batch_size": 4, "num_workers": 4, "channels_last": True, "compile_model": False},
+            "medium": {"epochs": 100, "image_size": 768, "batch_size": 8, "num_workers": 4, "channels_last": True, "compile_model": False},
+            "high": {"epochs": 100, "image_size": 768, "batch_size": 12, "num_workers": 6, "channels_last": True, "compile_model": False},
         },
         "nsec": {
-            "low": {"epochs": 80, "image_size": 768, "batch_size": 4, "num_workers": 4, "channels_last": True, "compile_model": False},
+            "low": {"epochs": 100, "image_size": 768, "batch_size": 4, "num_workers": 4, "channels_last": True, "compile_model": False},
             "medium": {"epochs": 100, "image_size": 768, "batch_size": 8, "num_workers": 4, "channels_last": True, "compile_model": False},
-            "high": {"epochs": 120, "image_size": 1024, "batch_size": 8, "num_workers": 6, "channels_last": True, "compile_model": True},
+            "high": {"epochs": 100, "image_size": 1024, "batch_size": 8, "num_workers": 6, "channels_last": True, "compile_model": False},
         },
         "detr": {
             "low": {"epochs": 100, "image_size": 640, "batch_size": 2, "num_workers": 4, "channels_last": True, "compile_model": False},
-            "medium": {"epochs": 120, "image_size": 768, "batch_size": 4, "num_workers": 4, "channels_last": True, "compile_model": False},
-            "high": {"epochs": 150, "image_size": 896, "batch_size": 4, "num_workers": 6, "channels_last": True, "compile_model": True},
+            "medium": {"epochs": 100, "image_size": 768, "batch_size": 4, "num_workers": 4, "channels_last": True, "compile_model": False},
+            "high": {"epochs": 100, "image_size": 896, "batch_size": 4, "num_workers": 6, "channels_last": True, "compile_model": False},
         },
     }
     for key, value in table[model_name][preset].items():
