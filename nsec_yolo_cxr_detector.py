@@ -34,15 +34,22 @@ from train_vindr_hybrid import (
     DETECT_NUM_CLASSES,
     CLASS_NAMES,
     VinDrDetectionDataset,
+    ClassBalancedDetectionBatchSampler,
     detection_collate,
     evaluate_map50,
     move_targets,
     save_checkpoint,
     seed_everything,
+    resolve_data_root,
+    resolve_training_device,
+    apply_gpu_training_preset,
     build_optimizer,
     set_warmup_cosine_lr,
     ModelEMA,
     save_detection_visualizations,
+    save_training_checkpoint,
+    resolve_resume_path,
+    load_training_checkpoint,
 )
 
 
@@ -390,6 +397,10 @@ def make_loader(args, split: str) -> DataLoader:
     max_images = args.max_images if split == "train" else args.val_max_images
     ds = VinDrDetectionDataset(args.data_root, args.image_size, split=split, val_fraction=args.val_fraction, seed=args.seed, max_images=max_images, positive_only=args.positive_only if split == "train" else False, lung_crop=args.lung_crop, test_fraction=args.test_fraction, use_jpg_cache=args.use_jpg_cache, jpg_quality=args.jpg_quality)
     kwargs = {"batch_size": args.batch_size, "shuffle": split == "train", "num_workers": args.num_workers, "collate_fn": detection_collate, "pin_memory": torch.cuda.is_available()}
+    if split == "train" and args.balanced_batches and not args.positive_only:
+        kwargs.pop("batch_size")
+        kwargs.pop("shuffle")
+        kwargs["batch_sampler"] = ClassBalancedDetectionBatchSampler(ds, args.batch_size, args.seed, args.positive_fraction)
     if args.num_workers > 0:
         kwargs["persistent_workers"] = True
         kwargs["prefetch_factor"] = 2
@@ -403,7 +414,8 @@ def visualize(model: nn.Module, args, device: torch.device) -> None:
 
 def train(args) -> None:
     seed_everything(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_training_device(args.device, args.require_cuda)
+    print(f"device={device} data={args.data_root}")
     cfg = HybridCXRConfig(num_classes=DETECT_NUM_CLASSES, image_channels=1, base_channels=args.base_channels, hidden_dim=args.hidden_dim, topk_per_head=args.topk_per_head, cls_loss_weight=args.cls_loss_weight, box_l1_weight=args.box_l1_weight, giou_weight=args.giou_weight, quality_weight=args.quality_weight)
     model = ExplicitNSECYOLO(cfg).to(device)
     if args.weight_init != "default":
@@ -420,10 +432,17 @@ def train(args) -> None:
     amp_enabled = args.amp and device.type == "cuda"
     scaler = make_grad_scaler(amp_enabled)
     step = 0
+    start_epoch = 0
     best_map = -1.0
-    for epoch in range(args.epochs):
+    resume_path = resolve_resume_path(args, "nsec_yolo_last.pt")
+    if resume_path is not None and resume_path.exists():
+        ckpt = load_training_checkpoint(resume_path, model, opt, scaler, device, ema)
+        start_epoch = int(ckpt.get("epoch", 0))
+        step = int(ckpt.get("step", 0))
+        best_map = float(ckpt.get("best_metric", best_map))
+    for epoch in range(start_epoch, args.epochs):
         model.train()
-        for images, targets in train_loader:
+        for epoch_step, (images, targets) in enumerate(train_loader):
             set_warmup_cosine_lr(opt, step, total_steps, args.warmup_steps, args.min_lr_ratio)
             opt.zero_grad(set_to_none=True)
             images = images.to(device, non_blocking=True)
@@ -446,12 +465,17 @@ def train(args) -> None:
                 save_checkpoint(args, ema.ema if ema else model, "nsec_yolo_smoke.pt")
                 eval_model = ema.ema if ema else model
                 return evaluate_map50(eval_model, val_loader, device, args.map_steps)
+            if args.steps_per_epoch and epoch_step + 1 >= args.steps_per_epoch:
+                break
         eval_model = ema.ema if ema else model
         map50 = evaluate_map50(eval_model, val_loader, device, args.map_steps)
         print(f"val epoch={epoch} mAP50={map50:.4f}")
         if map50 > best_map:
             best_map = map50
             save_checkpoint(args, eval_model, "nsec_yolo_best.pt")
+        save_training_checkpoint(args, model, opt, scaler, epoch + 1, step, best_map, "nsec_yolo_last.pt", ema)
+        if args.save_every_epoch:
+            save_training_checkpoint(args, model, opt, scaler, epoch + 1, step, best_map, f"nsec_yolo_epoch_{epoch + 1:03d}.pt", ema)
     save_checkpoint(args, ema.ema if ema else model, "nsec_yolo_final.pt")
     if args.visualize:
         visualize(ema.ema if ema else model, args, device)
@@ -470,11 +494,20 @@ def parse_args():
     p.add_argument("--val-fraction", type=float, default=0.1)
     p.add_argument("--test-fraction", type=float, default=0.1)
     p.add_argument("--positive-only", action="store_true")
+    p.add_argument("--balanced-batches", action="store_true", default=True)
+    p.add_argument("--no-balanced-batches", dest="balanced_batches", action="store_false")
+    p.add_argument("--positive-fraction", type=float, default=0.5)
     p.add_argument("--lung-crop", action="store_true", default=True)
     p.add_argument("--no-lung-crop", dest="lung_crop", action="store_false")
     p.add_argument("--use-jpg-cache", action="store_true", default=True)
     p.add_argument("--no-jpg-cache", dest="use_jpg_cache", action="store_false")
     p.add_argument("--jpg-quality", type=int, default=95)
+    p.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
+    p.add_argument("--require-cuda", action="store_true")
+    p.add_argument("--gpu-preset", choices=["auto", "low", "medium", "high", "none"], default="auto")
+    p.add_argument("--resume", type=str, default="", help="Resume from an explicit training checkpoint path.")
+    p.add_argument("--auto-resume", action="store_true", help="Resume from the latest checkpoint in output-dir if it exists.")
+    p.add_argument("--save-every-epoch", action="store_true", help="Keep a numbered checkpoint for every finished epoch.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--lr", type=float, default=2e-4)
@@ -510,12 +543,24 @@ def parse_args():
     p.add_argument("--search-trials", type=int, default=12)
     p.add_argument("--search-max-steps", type=int, default=80)
     p.add_argument("--search-seed", type=int, default=123)
+    p.add_argument("--quick-test", action="store_true", help="Run a short 5-epoch test with 64 train steps per epoch.")
+    p.add_argument("--quick-epochs", type=int, default=5)
+    p.add_argument("--quick-steps", type=int, default=64)
     p.add_argument("--smoke", action="store_true")
     args = p.parse_args()
+    args.data_root = resolve_data_root(str(args.data_root))
     args.max_steps = 0
+    args.steps_per_epoch = 0
+    apply_gpu_training_preset(args, "nsec")
+    if args.quick_test:
+        args.epochs = min(max(args.quick_epochs, 5), 10)
+        args.steps_per_epoch = min(max(args.quick_steps, 60), 70)
+        args.val_max_images = min(args.val_max_images, 128)
+        args.map_steps = min(args.map_steps, 10)
+        args.output_dir = args.output_dir / "quick_test"
     if args.smoke:
         args.epochs = 1; args.image_size = 128; args.batch_size = 2; args.max_images = 4; args.val_max_images = 4
-        args.base_channels = 8; args.hidden_dim = 32; args.topk_per_head = 8; args.max_steps = 1; args.warmup_steps = 1; args.log_every = 1; args.positive_only = True
+        args.base_channels = 8; args.hidden_dim = 32; args.topk_per_head = 8; args.max_steps = 1; args.steps_per_epoch = 1; args.warmup_steps = 1; args.log_every = 1; args.positive_only = True
     return args
 
 
